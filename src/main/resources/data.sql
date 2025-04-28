@@ -10,8 +10,12 @@ INSERT INTO integration_steps (id, flow_id, step_order, step_type, config)
 VALUES (2, 1, 2, 'sql', '{"query": "SELECT id, name FROM app_source"}');
 
 -- Step 3: Clean data processor
+/*INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
+VALUES (3, 1, 3, 'processor', '{"bean": "cleanDataProcessor"}');*/
+
+-- Add mapping processor after source query and before staging insert
 INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
-VALUES (3, 1, 3, 'processor', '{"bean": "cleanDataProcessor"}');
+VALUES (3, 1, 3, 'processor', '{"bean": "dynamicMappingProcessor"}');
 
 -- Step 4: Insert into staging
 INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
@@ -33,6 +37,11 @@ VALUES (7, 1, 7, 'mongodb', '{"collection": "syncedData", "operation": "insert"}
 INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
 VALUES (8, 1, 8, 'processor', '{"bean": "headerLogProcessor"}');
 
+-- Add some sample mappings
+INSERT INTO column_mappings (flow_id, source_column, target_column, transform_expression) 
+VALUES 
+(1, 'id', 'id', null),
+(1, 'name', 'name', 'TRIM');
 
 -- Step 5: REST endpoint call
 /*

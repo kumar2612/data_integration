@@ -1,5 +1,7 @@
 package com.example.cameldynamicpipeline;
 
+import java.util.List;
+
 import org.apache.camel.Exchange;
 import org.apache.camel.TypeConversionException;
 import org.apache.camel.TypeConverter;
@@ -30,8 +32,23 @@ public class CameldynamicpipelineApplication {
                         if (value != null) {
                             flowFile.setContent(value);
                         }
-                    }
+                    } 
                     return type.cast(flowFile);
+                } else if (value instanceof FlowFile) {
+                    // Extract content from FlowFile when converting to other types
+                    FlowFile flowFile = (FlowFile) value;
+                    Object content = flowFile.getContent();
+                    
+                    // Special handling for SQL parameters
+                    if (content instanceof List && !((List<?>) content).isEmpty()) {
+                        if (type.isAssignableFrom(List.class)) {
+                            return type.cast(content);
+                        }
+                    }
+                    
+                    if (content != null && type.isAssignableFrom(content.getClass())) {
+                        return type.cast(content);
+                    }
                 }
                 throw new TypeConversionException(value, type, null);
             }

@@ -27,3 +27,14 @@ CREATE TABLE staging_table (
     name VARCHAR(100),
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE column_mappings (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    flow_id INT,
+    source_column VARCHAR(255),
+    target_column VARCHAR(255),
+    transform_expression VARCHAR(1000),
+    active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (flow_id) REFERENCES integration_flows(id)
+);
