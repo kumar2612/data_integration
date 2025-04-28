@@ -2,9 +2,9 @@ package com.example.cameldynamicpipeline.handler;
 
 import org.apache.camel.model.RouteDefinition;
 import org.json.JSONObject;
-import static org.apache.camel.builder.Builder.constant;
 import org.springframework.stereotype.Component;
 import com.example.cameldynamicpipeline.entity.IntegrationStep;
+import com.example.cameldynamicpipeline.model.FlowFile;
 
 @Component("mongodb")
 public class MongoDBStepHandler implements StepHandler {
@@ -15,12 +15,26 @@ public class MongoDBStepHandler implements StepHandler {
         String operation = config.optString("operation", "insert");
         
         return route
-            // Set headers that will be available in subsequent routes
-            .setHeader("mongoCollection", constant(collection))
-            .setHeader("mongoOperation", constant(operation))
-            .setHeader("lastProcessedStep", constant("mongodb"))
-            // Use the MongoDB endpoint
+            .process(exchange -> {
+                // Ensure we have a FlowFile
+                FlowFile flowFile = exchange.getIn().getBody(FlowFile.class);
+                if (flowFile == null) {
+                    flowFile = new FlowFile();
+                    exchange.getIn().setBody(flowFile);
+                }
+                flowFile.addAttribute("mongodb.collection", collection);
+                flowFile.addAttribute("mongodb.operation", operation);
+                exchange.getIn().setBody(flowFile.getContent());
+            })
             .to(String.format("mongodb:mongoClient?database={{spring.data.mongodb.database}}&collection=%s&operation=%s", 
-                collection, operation));
+                collection, operation))
+            .process(exchange -> {
+                FlowFile flowFile = exchange.getProperty("flowFile", FlowFile.class);
+                if (flowFile == null) {
+                    flowFile = new FlowFile();
+                }
+                flowFile.addAttribute("mongodb.result", exchange.getIn().getBody());
+                exchange.getIn().setBody(flowFile);
+            });
     }
 }
