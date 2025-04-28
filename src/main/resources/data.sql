@@ -15,11 +15,24 @@ VALUES (3, 1, 3, 'processor', '{"bean": "cleanDataProcessor"}');
 
 -- Step 4: Insert into staging
 INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
-VALUES (4, 1, 4, 'sql', '{"query": "INSERT INTO staging_table (id, name) VALUES (:#id, :#name)"}');
+VALUES (4, 1, 4, 'sql', '{"query": "INSERT INTO staging_table (id, name) VALUES (:#id, :#name)", "batch": true}');
 
 -- Step 5: Upsert processor
 INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
 VALUES (5, 1, 5, 'processor', '{"bean": "upsertProcessor"}');
+
+-- Step 6: Console logging
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
+VALUES (6, 1, 6, 'processor', '{"bean": "consoleLogProcessor"}');
+
+-- Step 7: MongoDB insertion
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
+VALUES (7, 1, 7, 'mongodb', '{"collection": "syncedData", "operation": "insert"}');
+
+-- Step 8: Header logging
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config) 
+VALUES (8, 1, 8, 'processor', '{"bean": "headerLogProcessor"}');
+
 
 -- Step 5: REST endpoint call
 /*

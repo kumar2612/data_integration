@@ -1,7 +1,9 @@
 package com.example.cameldynamicpipeline.router;
 import com.example.cameldynamicpipeline.config.ApplicationContextProvider;
+import com.example.cameldynamicpipeline.config.StepHandlerRegistry;
 import com.example.cameldynamicpipeline.entity.IntegrationFlow;
 import com.example.cameldynamicpipeline.entity.IntegrationStep;
+import com.example.cameldynamicpipeline.handler.StepHandler;
 import com.example.cameldynamicpipeline.repository.IntegrationFlowRepository;
 import com.example.cameldynamicpipeline.repository.IntegrationStepRepository;
 
@@ -23,6 +25,8 @@ public class DynamicRouteLoader {
     @Autowired private CamelContext camelContext;
     @Autowired private IntegrationFlowRepository flowRepo;
     @Autowired private IntegrationStepRepository stepRepo;
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
 
     @PostConstruct
     public void loadRoutes() throws Exception {
@@ -41,31 +45,11 @@ public class DynamicRouteLoader {
                         .routeId(flow.getName());
 
                 for (IntegrationStep step : steps) {
-                    switch (step.getStepType()) {
-                        case "sql" -> {
-                            String query = new JSONObject(step.getConfig()).getString("query");
-                            System.out.println("SQL Query: " + query);
-                            route = route.to("sql:" + query + "?dataSource=#dataSource");
-                        }
-                        case "processor" -> {
-                            String bean = new JSONObject(step.getConfig()).getString("bean");
-                            System.out.println("Processor Bean: " + bean);
-                            route = route.process(resolveProcessor(bean));
-                        }
-                        case "rest" -> {
-                            String url = new JSONObject(step.getConfig()).getString("url");
-                            System.out.println("REST URL: " + url);
-                            route = route.marshal().json().to(url);
-                        }
-                        default -> throw new RuntimeException("Unknown step type: " + step.getStepType());
-                    }
+                    StepHandler handler = stepHandlerRegistry.getHandler(step.getStepType());
+                    route = handler.apply(route, step);
                 }
             }
         };
-    }
-
-    private Processor resolveProcessor(String beanName) {
-        return ApplicationContextProvider.getBean(beanName, Processor.class);
     }
 }
 
