@@ -1,0 +1,386 @@
+-- schema.sql
+
+CREATE TABLE integration_flows (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    schedule_cron VARCHAR(50),
+    active BOOLEAN
+);
+
+CREATE TABLE integration_steps (
+    id INT PRIMARY KEY,
+    flow_id INT,
+    step_order INT,
+    step_type VARCHAR(50),
+    config CLOB,
+    condition_expr VARCHAR(255),
+    on_true_step INT,
+    on_false_step INT,
+    parent_step_id INT,
+    FOREIGN KEY (flow_id) REFERENCES integration_flows(id)
+);
+
+-- data.sql
+
+-- Flow definition
+INSERT INTO integration_flows (id, name, schedule_cron, active) VALUES (1, 'complexFlow', '0/30 * * * * ?', true);
+
+-- Root Step: Parallel block
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (1, 1, 1, 'parallel', '{}', NULL);
+
+-- Parallel children
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (2, 1, 1, 'sql', '{"query":"SELECT * FROM source_table1"}', 1);
+
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (3, 1, 2, 'sql', '{"query":"SELECT * FROM source_table2"}', 1);
+
+-- Choice block after parallel
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, condition_expr, parent_step_id) 
+VALUES (4, 1, 2, 'choice', '{}', '${body.size} > 0', NULL);
+
+-- Children of choice
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (5, 1, 1, 'processor', '{"bean":"cleanDataProcessor"}', 4);
+
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (6, 1, 2, 'rest', '{"url":"http://localhost:8081/api/target"}', 4);
+
+-- Loop block
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, condition_expr, parent_step_id) 
+VALUES (7, 1, 3, 'loop', '{}', '${body.size < 5}', NULL);
+
+-- Loop child
+INSERT INTO integration_steps (id, flow_id, step_order, step_type, config, parent_step_id) 
+VALUES (8, 1, 1, 'processor', '{"bean":"cleanDataProcessor"}', 7);
+
+-----------------
+
+// ParallelStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+public class ParallelStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        if (children == null || children.isEmpty()) return route;
+
+        route.split().parallelProcessing().body().process(exchange -> {
+            // placeholder: pass to parallel child route via bean, enrich etc.
+        });
+
+        for (IntegrationStepConfig child : children) {
+            // Register child routes by invoking handlers, or use wireTap/sendTo
+        }
+        return route;
+    }
+
+    @Override
+    public String getStepType() {
+        return "parallel";
+    }
+}
+
+// ChoiceStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.ChoiceDefinition;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+public class ChoiceStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        String condition = step.getConditionExpr();
+        ChoiceDefinition choice = route.choice();
+
+        for (IntegrationStepConfig child : children) {
+            // naive match: first child as true, second as false branch
+            if (children.indexOf(child) == 0) {
+                choice.when().simple(condition).process(exchange -> {
+                    // apply true branch logic
+                });
+            } else {
+                choice.otherwise().process(exchange -> {
+                    // apply false branch logic
+                });
+            }
+        }
+
+        choice.end();
+        return route;
+    }
+
+    @Override
+    public String getStepType() {
+        return "choice";
+    }
+}
+
+// LoopStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+public class LoopStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        String condition = step.getConditionExpr();
+
+        return route.loopDoWhile(simple(condition))
+                    .process(exchange -> {
+                        // process loop body or delegate
+                    })
+                .end();
+    }
+
+    @Override
+    public String getStepType() {
+        return "loop";
+    }
+}
+
+----------------------------
+
+package com.example.dynamicrouting.route;
+
+import com.example.dynamicrouting.model.IntegrationFlowConfig;
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import com.example.dynamicrouting.repository.IntegrationFlowRepository;
+import com.example.dynamicrouting.repository.IntegrationStepRepository;
+import com.example.dynamicrouting.route.handler.StepHandler;
+import com.example.dynamicrouting.route.handler.StepHandlerRegistry;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Component
+public class DynamicRouteLoader extends RouteBuilder {
+
+    @Autowired
+    private IntegrationFlowRepository flowRepository;
+
+    @Autowired
+    private IntegrationStepRepository stepRepository;
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public void configure() throws Exception {
+        List<IntegrationFlowConfig> flows = flowRepository.findAllByActive(true);
+
+        for (IntegrationFlowConfig flow : flows) {
+            List<IntegrationStepConfig> allSteps = stepRepository.findByFlowIdOrderByStepOrder(flow.getId());
+
+            // Build step tree for nesting
+            Map<Integer, List<IntegrationStepConfig>> stepTree = allSteps.stream()
+                .collect(Collectors.groupingBy(s -> Optional.ofNullable(s.getParentStepId()).orElse(0)));
+
+            List<IntegrationStepConfig> rootSteps = stepTree.getOrDefault(0, Collections.emptyList());
+
+            RouteDefinition route = from("quartz://" + flow.getName() + "?cron=" + flow.getScheduleCron())
+                    .routeId(flow.getName());
+
+            for (IntegrationStepConfig rootStep : rootSteps) {
+                route = buildStepTree(route, rootStep, stepTree);
+            }
+        }
+    }
+
+    private RouteDefinition buildStepTree(RouteDefinition route, IntegrationStepConfig step,
+                                          Map<Integer, List<IntegrationStepConfig>> stepTree) {
+        StepHandler handler = stepHandlerRegistry.getHandler(step.getStepType());
+        List<IntegrationStepConfig> children = stepTree.getOrDefault(step.getId(), Collections.emptyList());
+        return handler.apply(route, step, children);
+    }
+}
+
+------------------------------------
+
+package com.example.dynamicrouting.route;
+
+import com.example.dynamicrouting.model.IntegrationFlowConfig;
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import com.example.dynamicrouting.repository.IntegrationFlowRepository;
+import com.example.dynamicrouting.repository.IntegrationStepRepository;
+import com.example.dynamicrouting.route.handler.StepHandler;
+import com.example.dynamicrouting.route.handler.StepHandlerRegistry;
+import org.apache.camel.builder.RouteBuilder;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Component
+public class DynamicRouteLoader extends RouteBuilder {
+
+    @Autowired
+    private IntegrationFlowRepository flowRepository;
+
+    @Autowired
+    private IntegrationStepRepository stepRepository;
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public void configure() throws Exception {
+        List<IntegrationFlowConfig> flows = flowRepository.findAllByActive(true);
+
+        for (IntegrationFlowConfig flow : flows) {
+            List<IntegrationStepConfig> allSteps = stepRepository.findByFlowIdOrderByStepOrder(flow.getId());
+
+            Map<Integer, List<IntegrationStepConfig>> stepTree = allSteps.stream()
+                .collect(Collectors.groupingBy(s -> Optional.ofNullable(s.getParentStepId()).orElse(0)));
+
+            List<IntegrationStepConfig> rootSteps = stepTree.getOrDefault(0, Collections.emptyList());
+
+            RouteDefinition route = from("quartz://" + flow.getName() + "?cron=" + flow.getScheduleCron())
+                    .routeId(flow.getName());
+
+            for (IntegrationStepConfig rootStep : rootSteps) {
+                route = buildStepTree(route, rootStep, stepTree);
+            }
+        }
+    }
+
+    private RouteDefinition buildStepTree(RouteDefinition route, IntegrationStepConfig step,
+                                          Map<Integer, List<IntegrationStepConfig>> stepTree) {
+        StepHandler handler = stepHandlerRegistry.getHandler(step.getStepType());
+        List<IntegrationStepConfig> children = stepTree.getOrDefault(step.getId(), Collections.emptyList());
+        return handler.apply(route, step, children);
+    }
+}
+
+
+
+----------------------------
+
+// src/main/java/com/example/dynamicrouting/route/handler/ApiLoginStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+public class ApiLoginStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        String loginUrl = step.getConfigValue("url");
+        String username = step.getConfigValue("username");
+        String password = step.getConfigValue("password");
+
+        return route.setHeader("Authorization", constant("Basic " + java.util.Base64.getEncoder()
+                        .encodeToString((username + ":" + password).getBytes())))
+                    .to(loginUrl);
+    }
+
+    @Override
+    public String getStepType() {
+        return "api_login";
+    }
+}
+
+// src/main/java/com/example/dynamicrouting/route/handler/PaginatedApiStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+import static org.apache.camel.builder.Builder.simple;
+
+@Component
+public class PaginatedApiStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        String url = step.getConfigValue("url");
+        String queryTemplate = step.getConfigValue("queryParamTemplate");
+        String conditionExpr = step.getConfigValue("loopCondition");
+
+        RouteDefinition loopRoute = route.loopDoWhile(simple(conditionExpr))
+            .process(exchange -> {
+                int offset = exchange.getProperty("offset", Integer.class) != null ? exchange.getProperty("offset", Integer.class) : 0;
+                String finalUrl = url + "?" + queryTemplate.replace("${offset}", String.valueOf(offset));
+                exchange.getIn().setHeader("CamelHttpUri", finalUrl);
+            })
+            .toD("${header.CamelHttpUri}")
+            .process(exchange -> {
+                int offset = exchange.getProperty("offset", Integer.class) != null ? exchange.getProperty("offset", Integer.class) : 0;
+                exchange.setProperty("offset", offset + 10);
+            });
+
+        // Process child steps inside this loop
+        for (IntegrationStepConfig child : children) {
+            StepHandler childHandler = StepHandlerRegistry.getHandler(child.getStepType());
+            loopRoute = childHandler.apply(loopRoute, child, List.of());
+        }
+
+        return loopRoute.end();
+    }
+
+    @Override
+    public String getStepType() {
+        return "paginated_api";
+    }
+}
+
+// src/main/java/com/example/dynamicrouting/route/handler/DbUpsertStepHandler.java
+package com.example.dynamicrouting.route.handler;
+
+import com.example.dynamicrouting.model.IntegrationStepConfig;
+import org.apache.camel.model.RouteDefinition;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+public class DbUpsertStepHandler implements StepHandler {
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, List<IntegrationStepConfig> children) {
+        String sql = step.getConfigValue("query");
+
+        // Use parallel processing to insert/upsert data in parallel
+        return route.split().jsonpath("$[*]").parallelProcessing()
+                     .to("sql:" + sql + "?dataSource=#targetDs");
+    }
+
+    @Override
+    public String getStepType() {
+        return "db_upsert";
+    }
+}
