@@ -384,3 +384,63 @@ public class DbUpsertStepHandler implements StepHandler {
         return "db_upsert";
     }
 }
+
+@Override
+public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step) {
+    JSONObject config = new JSONObject(step.getConfig());
+
+    return route.process(exchange -> {
+        ConfigResolver resolver = new ConfigResolver(exchange);
+
+        // Resolve all top-level keys (url, method, headers, body, etc.)
+        String url = resolver.resolve(config.getString("url"));
+        String method = config.optString("method", "POST").toUpperCase();
+
+        // Optional headers and body
+        JSONObject headers = config.has("headers") ? resolver.resolveJson(config.getJSONObject("headers")) : new JSONObject();
+        JSONObject body = config.has("body") ? resolver.resolveJson(config.getJSONObject("body")) : new JSONObject();
+
+        // Set headers
+        for (String key : headers.keySet()) {
+            exchange.getIn().setHeader(key, headers.getString(key));
+        }
+
+        // Set method and URL
+        exchange.getIn().setHeader(Exchange.HTTP_METHOD, method);
+        exchange.getIn().setHeader(Exchange.HTTP_URI, url);
+
+        // Set body
+        exchange.getIn().setBody(body.toString());
+
+    }).to("http://dummy") // will be overridden by Exchange.HTTP_URI
+      .process(exchange -> {
+          // Optional: extract token from login response and store in Exchange
+          JSONObject response = new JSONObject(exchange.getMessage().getBody(String.class));
+
+          if (response.has("token")) {
+              String token = response.getString("token");
+              exchange.setProperty("token", token);
+          }
+
+          // Optional: store any other fields for downstream steps
+      });
+}
+
+
+{
+  "url": "https://example.com/login",
+  "method": "POST",
+  "body": {
+    "username": "user",
+    "password": "ENC::api.password"
+  }
+}
+
+
+{
+  "url": "https://example.com/data?page=1",
+  "method": "GET",
+  "headers": {
+    "Authorization": "Bearer ${token}"
+  }
+}
