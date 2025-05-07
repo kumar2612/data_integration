@@ -444,3 +444,423 @@ public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step) 
     "Authorization": "Bearer ${token}"
   }
 }
+
+---------------------------------
+
+config resolver with transform 
+
+package com.example.dynamicrouting.util;
+
+import org.apache.camel.Exchange;
+
+import java.lang.reflect.Method;
+import java.util.*;
+
+public class TransformService {
+
+    private final Map<String, Method> transformMap = new HashMap<>();
+
+    public TransformService() {
+        for (Method method : this.getClass().getDeclaredMethods()) {
+            if (method.isAnnotationPresent(Transform.class)) {
+                transformMap.put(method.getName(), method);
+            }
+        }
+    }
+
+    public String apply(String operation, String input, Exchange exchange) {
+        try {
+            Method method = transformMap.get(operation);
+            if (method == null) return input;
+            return (String) method.invoke(this, input, exchange);
+        } catch (Exception e) {
+            return input; // fallback silently
+        }
+    }
+
+    public String applyChain(List<String> ops, String input, Exchange exchange) {
+        for (String op : ops) {
+            input = apply(op, input, exchange);
+        }
+        return input;
+    }
+
+    // === Transformations ===
+
+    @Transform
+    public String capitalize(String value, Exchange exchange) {
+        if (value == null || value.isEmpty()) return value;
+        return Character.toUpperCase(value.charAt(0)) + value.substring(1);
+    }
+
+    @Transform
+    public String toLowerCase(String value, Exchange exchange) {
+        return value != null ? value.toLowerCase() : null;
+    }
+
+    @Transform
+    public String toUpperCase(String value, Exchange exchange) {
+        return value != null ? value.toUpperCase() : null;
+    }
+
+    @Transform
+    public String increment(String value, Exchange exchange) {
+        try {
+            return String.valueOf(Integer.parseInt(value) + 1);
+        } catch (NumberFormatException e) {
+            return value;
+        }
+    }
+
+    @Transform
+    public String appendToken(String value, Exchange exchange) {
+        String token = exchange.getProperty("token", String.class);
+        return value + "?token=" + token;
+    }
+
+    // Add more @Transform methods here...
+}
+
+
+package com.example.dynamicrouting.util;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Transform {}
+
+
+package com.example.dynamicrouting.util;
+
+import org.apache.camel.Exchange;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+public class ConfigResolver {
+
+    private final Exchange exchange;
+    private final TransformService transformService;
+
+    public ConfigResolver(Exchange exchange, TransformService transformService) {
+        this.exchange = exchange;
+        this.transformService = transformService;
+    }
+
+    public String resolve(String value, List<String> transforms) {
+        if (value == null) return null;
+
+        // Basic dynamic references like ${headers.userId}
+        String resolved = value.replaceAll("\\$\\{([^}]+)}", match -> {
+            String path = match.group(1);
+            if (path.startsWith("headers.")) {
+                return exchange.getIn().getHeader(path.substring(8), String.class);
+            } else if (path.startsWith("properties.")) {
+                return exchange.getProperty(path.substring(11), String.class);
+            } else {
+                return match.group(0);
+            }
+        });
+
+        return transforms != null ? transformService.applyChain(transforms, resolved, exchange) : resolved;
+    }
+
+    public JSONObject resolveJson(JSONObject json) {
+        JSONObject resolved = new JSONObject();
+        for (String key : json.keySet()) {
+            Object val = json.get(key);
+            if (val instanceof JSONObject) {
+                resolved.put(key, resolveJson((JSONObject) val));
+            } else if (val instanceof JSONArray) {
+                JSONArray array = (JSONArray) val;
+                List<Object> resolvedList = IntStream.range(0, array.length())
+                        .mapToObj(i -> array.get(i) instanceof JSONObject
+                                ? resolveJson(array.getJSONObject(i))
+                                : array.get(i))
+                        .collect(Collectors.toList());
+                resolved.put(key, resolvedList);
+            } else {
+                resolved.put(key, val); // extend to resolve if val is a String
+            }
+        }
+        return resolved;
+    }
+}
+
+
+{
+  "url": "${headers.apiBase}/data",
+  "transforms": ["appendToken", "toUpperCase"]
+}
+
+
+exchange.getIn().setHeader("apiBase", "https://example.com");
+
+TransformService transformService = new TransformService();
+ConfigResolver resolver = new ConfigResolver(exchange, transformService);
+
+JSONObject config = new JSONObject(step.getConfig());
+
+String url = resolver.resolve(config.getString("url"),
+                List.of("appendToken", "toUpperCase"));
+
+
+public String resolve(String value, List<String> transforms) {
+    if (value == null) return null;
+
+    String resolved = value.replaceAll("\\$\\{([^}]+)}", match -> {
+        String path = match.group(1);
+        String[] segments = path.split("\\.");
+        if (segments.length < 2) return match.group(0); // Invalid format
+
+        String scope = segments[0];
+        String keyPath = path.substring(scope.length() + 1); // remove "scope."
+
+        Object result = null;
+        switch (scope) {
+            case "headers" -> result = resolveFromMap(exchange.getIn().getHeaders(), keyPath);
+            case "properties" -> result = resolveFromMap(exchange.getProperties(), keyPath);
+            case "body" -> result = resolveFromBody(exchange.getIn().getBody(), keyPath);
+            default -> result = match.group(0); // return as-is if unknown scope
+        }
+
+        return result != null ? result.toString() : "";
+    });
+
+    return transforms != null ? transformService.applyChain(transforms, resolved, exchange) : resolved;
+}
+
+
+private Object resolveFromMap(Map<String, Object> map, String keyPath) {
+    String[] keys = keyPath.split("\\.");
+    Object value = map;
+    for (String key : keys) {
+        if (value instanceof Map<?, ?> castMap) {
+            value = castMap.get(key);
+        } else {
+            return null;
+        }
+    }
+    return value;
+}
+
+private Object resolveFromBody(Object body, String keyPath) {
+    if (body instanceof Map<?, ?> mapBody) {
+        return resolveFromMap(mapBody, keyPath);
+    }
+
+    // Optionally support JSON object using Jackson or org.json
+    try {
+        JSONObject json = new JSONObject(body.toString());
+        return resolveFromJson(json, keyPath);
+    } catch (Exception e) {
+        return null;
+    }
+}
+
+private Object resolveFromJson(JSONObject json, String keyPath) {
+    String[] keys = keyPath.split("\\.");
+    Object value = json;
+    for (String key : keys) {
+        if (value instanceof JSONObject jsonObj && jsonObj.has(key)) {
+            value = jsonObj.get(key);
+        } else {
+            return null;
+        }
+    }
+    return value;
+}
+
+
+Updated Full Implementation with Array Index Support
+java
+Copy
+Edit
+public String resolve(String value, List<String> transforms) {
+    if (value == null) return null;
+
+    String resolved = value.replaceAll("\\$\\{([^}]+)}", match -> {
+        String path = match.group(1);
+        String[] segments = path.split("\\.");
+        if (segments.length < 2) return match.group(0); // Invalid format
+
+        String scope = segments[0];
+        String keyPath = path.substring(scope.length() + 1);
+
+        Object result = null;
+        switch (scope) {
+            case "headers" -> result = resolveFromMap(exchange.getIn().getHeaders(), keyPath);
+            case "properties" -> result = resolveFromMap(exchange.getProperties(), keyPath);
+            case "body" -> result = resolveFromBody(exchange.getIn().getBody(), keyPath);
+            default -> result = match.group(0); // leave unresolved
+        }
+
+        return result != null ? result.toString() : "";
+    });
+
+    return transforms != null ? transformService.applyChain(transforms, resolved, exchange) : resolved;
+}
+🔧 Helpers (Array Support in JSON)
+java
+Copy
+Edit
+private Object resolveFromMap(Map<String, Object> map, String keyPath) {
+    String[] keys = keyPath.split("\\.");
+    Object value = map;
+    for (String key : keys) {
+        if (value instanceof Map<?, ?> castMap) {
+            value = castMap.get(key);
+        } else {
+            return null;
+        }
+    }
+    return value;
+}
+
+private Object resolveFromBody(Object body, String keyPath) {
+    if (body instanceof Map<?, ?> mapBody) {
+        return resolveFromMap(mapBody, keyPath);
+    }
+
+    try {
+        JSONObject json = new JSONObject(body.toString());
+        return resolveFromJson(json, keyPath);
+    } catch (Exception e) {
+        return null;
+    }
+}
+
+private Object resolveFromJson(Object current, String keyPath) {
+    String[] parts = keyPath.split("\\.");
+
+    for (String part : parts) {
+        if (current == null) return null;
+
+        // Handle array index: e.g., "items[0]"
+        if (part.matches(".+\\[\\d+\\]")) {
+            String key = part.substring(0, part.indexOf('['));
+            int index = Integer.parseInt(part.replaceAll(".+\\[(\\d+)]", "$1"));
+
+            if (current instanceof JSONObject obj && obj.has(key)) {
+                Object arr = obj.get(key);
+                if (arr instanceof JSONArray jsonArray && jsonArray.length() > index) {
+                    current = jsonArray.get(index);
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+
+        } else {
+            if (current instanceof JSONObject obj && obj.has(part)) {
+                current = obj.get(part);
+            } else {
+                return null;
+            }
+        }
+    }
+
+    return current;
+}
+
+------
+
+children route step decalaration
+
+@Component
+public class LoopStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition parentRoute, IntegrationStepConfig loopStep, StepContext context) {
+        List<IntegrationStepConfig> children = context.getStepTree().getOrDefault(loopStep.getId(), List.of());
+
+        // Dynamic child step routes
+        RouteDefinition loopRoute = parentRoute;
+
+        // Loop until condition is met
+        loopRoute = loopRoute.loopDoWhile(simple("${exchangeProperty[hasMore]}"));
+
+        // Dynamically add child steps as subroutes
+        for (IntegrationStepConfig childStep : children) {
+            // Get the handler for the child step dynamically from registry
+            StepHandler handler = stepHandlerRegistry.getHandler(childStep.getStepType());
+
+            // Dynamically apply the handler to this child step, passing the parent route
+            loopRoute = handler.apply(loopRoute, childStep, context);
+        }
+
+        // Ensure the route completes and adds processing on completion
+        loopRoute.to("mock:final");
+        return loopRoute;
+    }
+}
+
+
+@Component
+public class ParallelStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition parentRoute, IntegrationStepConfig parallelStep, StepContext context) {
+        List<IntegrationStepConfig> children = context.getStepTree().getOrDefault(parallelStep.getId(), List.of());
+
+        // Dynamic parallel route
+        RouteDefinition parallelRoute = parentRoute.multicast().parallelProcessing();
+
+        // Dynamically add child steps to parallel processing
+        for (IntegrationStepConfig childStep : children) {
+            StepHandler handler = stepHandlerRegistry.getHandler(childStep.getStepType());
+
+            // Apply handler to each child step and add to the parallel processing flow
+            parallelRoute = handler.apply(parallelRoute, childStep, context);
+        }
+
+        // Final destination for parallel processing results
+        parallelRoute.to("mock:parallelResult");
+        return parallelRoute;
+    }
+}
+
+
+@Component
+public class ChoiceStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition parentRoute, IntegrationStepConfig choiceStep, StepContext context) {
+        List<IntegrationStepConfig> children = context.getStepTree().getOrDefault(choiceStep.getId(), List.of());
+
+        RouteDefinition choiceRoute = parentRoute.choice();
+
+        // Add dynamic conditions for each child
+        for (IntegrationStepConfig childStep : children) {
+            StepHandler handler = stepHandlerRegistry.getHandler(childStep.getStepType());
+
+            // Condition can be any condition logic like simple expressions or header checks
+            String condition = childStep.getConfig().getString("condition");
+
+            // Apply child step handler dynamically
+            choiceRoute.when(simple(condition)).to("direct:" + childStep.getStepOrder());
+
+            // Apply child step handler for its own logic
+            choiceRoute = handler.apply(choiceRoute, childStep, context);
+        }
+
+        // Default route for choice condition if none match
+        choiceRoute.otherwise().to("mock:default");
+
+        return choiceRoute;
+    }
+}
