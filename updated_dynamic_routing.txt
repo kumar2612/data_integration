@@ -277,3 +277,37 @@ Copy
 Edit
 route.log("End of loop iteration. Current page: ${header.page}");
 Would you like me to generate an in-memory runnable Spring Boot + Camel example for this?
+
+
+@Component
+public class LoopStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context) {
+        JSONObject config = new JSONObject(step.getConfig());
+        String condition = config.getString("condition"); // e.g., "${exchangeProperty[hasMore]}"
+
+        // Create the loop block
+        LoopDefinition loop = new LoopDefinition();
+        loop.setExpression(simple(condition));
+
+        // Add each child step to the loop
+        for (IntegrationStepConfig child : context.getChildren(step.getId())) {
+            StepHandler handler = stepHandlerRegistry.getHandler(child.getStepType());
+
+            // Create a temporary RouteDefinition to build the child DSL
+            RouteDefinition temp = new RouteDefinition();
+            handler.apply(temp, child, context);
+
+            // Add child steps to loop
+            loop.addOutput(temp.getOutputs());
+        }
+
+        // Attach loop to route
+        route.addOutput(loop);
+        return route;
+    }
+}
