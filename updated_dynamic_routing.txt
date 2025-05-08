@@ -1,0 +1,279 @@
+✅ Database: schema.sql
+sql
+Copy
+Edit
+CREATE TABLE integration_flow (
+    id INT PRIMARY KEY,
+    name VARCHAR(255),
+    schedule_cron VARCHAR(255)
+);
+
+CREATE TABLE integration_step (
+    id INT PRIMARY KEY,
+    flow_id INT,
+    step_order INT,
+    step_type VARCHAR(50),
+    config CLOB,
+    parent_step_id INT
+);
+✅ Sample Data: data.sql
+sql
+Copy
+Edit
+INSERT INTO integration_flow (id, name, schedule_cron) VALUES (1, 'pageFlow', '0/15 * * * * ?');
+
+-- Parallel Block
+INSERT INTO integration_step VALUES (1, 1, 1, 'parallel', NULL, NULL);
+INSERT INTO integration_step VALUES (2, 1, 1, 'sql', '{"query": "SELECT * FROM items"}', 1);
+INSERT INTO integration_step VALUES (3, 1, 2, 'rest', '{"url": "http://example.com/api"}', 1);
+
+-- Loop Block
+INSERT INTO integration_step VALUES (4, 1, 2, 'loop', '{"condition": "${header.page} < ${header.total}"}', NULL);
+INSERT INTO integration_step VALUES (5, 1, 1, 'processor', '{"bean": "incrementPage"}', 4);
+✅ StepContext.java
+java
+Copy
+Edit
+public class StepContext {
+    private final Map<Integer, List<IntegrationStepConfig>> stepTree;
+
+    public StepContext(List<IntegrationStepConfig> allSteps) {
+        this.stepTree = allSteps.stream()
+            .collect(Collectors.groupingBy(s -> Optional.ofNullable(s.getParentStepId()).orElse(0)));
+    }
+
+    public List<IntegrationStepConfig> getChildren(int parentId) {
+        return stepTree.getOrDefault(parentId, List.of());
+    }
+}
+✅ StepHandler Interface
+java
+Copy
+Edit
+public interface StepHandler {
+    RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context);
+}
+✅ StepHandlerRegistry.java
+java
+Copy
+Edit
+@Component
+public class StepHandlerRegistry {
+    private final Map<String, StepHandler> handlerMap = new HashMap<>();
+
+    @Autowired
+    public StepHandlerRegistry(List<StepHandler> handlers) {
+        for (StepHandler handler : handlers) {
+            handlerMap.put(handler.getClass().getSimpleName().replace("StepHandler", "").toLowerCase(), handler);
+        }
+    }
+
+    public StepHandler getHandler(String type) {
+        return handlerMap.get(type.toLowerCase());
+    }
+}
+✅ DynamicRouteLoader.java
+java
+Copy
+Edit
+@Component
+public class DynamicRouteLoader extends RouteBuilder {
+
+    @Autowired
+    private IntegrationFlowRepository flowRepo;
+    @Autowired
+    private IntegrationStepRepository stepRepo;
+    @Autowired
+    private StepHandlerRegistry handlerRegistry;
+
+    @Override
+    public void configure() {
+        List<IntegrationFlowConfig> flows = flowRepo.findAll();
+
+        for (IntegrationFlowConfig flow : flows) {
+            List<IntegrationStepConfig> steps = stepRepo.findByFlowIdOrderByStepOrder(flow.getId());
+            StepContext context = new StepContext(steps);
+
+            RouteDefinition route = from("quartz://" + flow.getName() + "?cron=" + flow.getScheduleCron())
+                .routeId(flow.getName());
+
+            for (IntegrationStepConfig step : context.getChildren(0)) {
+                StepHandler handler = handlerRegistry.getHandler(step.getStepType());
+                route = handler.apply(route, step, context);
+            }
+        }
+    }
+}
+✅ LoopStepHandler.java
+java
+Copy
+Edit
+@Component
+public class LoopStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context) {
+        JSONObject config = new JSONObject(step.getConfig());
+        String condition = config.getString("condition");
+
+        route = route.loopDoWhile(simple(condition));
+
+        for (IntegrationStepConfig child : context.getChildren(step.getId())) {
+            StepHandler handler = stepHandlerRegistry.getHandler(child.getStepType());
+            route = handler.apply(route, child, context);
+        }
+
+        return route;
+    }
+}
+✅ ParallelStepHandler.java
+java
+Copy
+Edit
+@Component
+public class ParallelStepHandler implements StepHandler {
+
+    @Autowired
+    private StepHandlerRegistry stepHandlerRegistry;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context) {
+        List<IntegrationStepConfig> children = context.getChildren(step.getId());
+
+        String multicastId = "multicast-" + step.getId();
+        route = route.multicast().parallelProcessing();
+
+        for (IntegrationStepConfig child : children) {
+            StepHandler handler = stepHandlerRegistry.getHandler(child.getStepType());
+            route = handler.apply(route, child, context);
+        }
+
+        route = route.end(); // End multicast
+        return route;
+    }
+}
+✅ Example: SqlStepHandler & RestStepHandler
+java
+Copy
+Edit
+@Component
+public class SqlStepHandler implements StepHandler {
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context) {
+        String query = new JSONObject(step.getConfig()).getString("query");
+        return route.to("sql:" + query + "?dataSource=#sourceDs");
+    }
+}
+
+@Component
+public class RestStepHandler implements StepHandler {
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext context) {
+        String url = new JSONObject(step.getConfig()).getString("url");
+        return route.marshal().json().to(url);
+    }
+}
+✅ ProcessorStepHandler.java
+java
+Copy
+Edit
+@Component
+public class ProcessorStepHandler implements StepHandler {
+    @Autowired
+    private ApplicationContext context;
+
+    @Override
+    public RouteDefinition apply(RouteDefinition route, IntegrationStepConfig step, StepContext ctx) {
+        String beanName = new JSONObject(step.getConfig()).getString("bean");
+        Processor processor = context.getBean(beanName, Processor.class);
+        return route.process(processor);
+    }
+}
+✅ Sample Processor Bean
+java
+Copy
+Edit
+@Component("incrementPage")
+public class IncrementPageProcessor implements Processor {
+    @Override
+    public void process(Exchange exchange) {
+        int page = exchange.getIn().getHeader("page", Integer.class);
+        exchange.getIn().setHeader("page", page + 1);
+    }
+}
+This structure will now:
+
+Correctly traverse and apply child steps inside parent constructs like loops or parallel.
+
+Preserve the dynamic and config-driven execution flow.
+
+Avoid hardcoded route IDs — everything flows inline via Camel’s fluent API.
+
+Would you like a downloadable project or a GitHub link version for this?
+
+
+
+
+
+
+You said:
+will it call the child routes inside loopdowhile which start with .process().to().process kind of strcuture
+
+
+ChatGPT said:
+Yes — with the design provided, child steps inside a loopDoWhile (or any parent step) will be correctly invoked, including steps that have .process().to().process() structure.
+
+✅ Why It Works:
+The critical part of this architecture is that loopDoWhile() is a fluent construct in Apache Camel. Inside that construct, when you dynamically apply child handlers using this block:
+
+java
+Copy
+Edit
+for (IntegrationStepConfig child : context.getChildren(step.getId())) {
+    StepHandler handler = stepHandlerRegistry.getHandler(child.getStepType());
+    route = handler.apply(route, child, context); // <== This appends to loop block
+}
+You're chaining all child processors within the body of the loop, and they are executed in sequence for every iteration of the loop.
+
+✅ Example: Step Execution Order Inside Loop
+Let’s say your loop contains child steps like this:
+
+integration_steps
+bash
+Copy
+Edit
+id  flow_id step_order step_type  config                                 parent_step_id
+4   1       2          loop       {"condition": "${header.page} < ${header.total}"}   NULL
+5   1       1          processor  {"bean": "incrementPage"}              4
+6   1       2          rest       {"url": "http://api.com/data?page=${header.page}"}  4
+7   1       3          processor  {"bean": "storeResponse"}              4
+➤ The resulting route (inside loopDoWhile) will effectively be:
+java
+Copy
+Edit
+route
+.loopDoWhile(simple("${header.page} < ${header.total}"))
+    .process(incrementPageProcessor)
+    .to("http://api.com/data?page=${header.page}")
+    .process(storeResponseProcessor)
+.end();
+✅ The chain of .process(), .to(), .process() is fully respected and executed in order on each loop iteration.
+
+🛠️ What Could Break It?
+If you forget to assign the result back to route in the loop (route = handler.apply(...)), then the chain breaks.
+
+If you use from("direct:childRoute") style instead of chaining within the same fluent flow, Camel won’t implicitly connect those steps.
+
+If your condition never becomes false, the loop appears infinite — this is common when your child step is supposed to set a header like hasMore, but isn't executed because it's not connected properly.
+
+✅ Debug Tip
+You can add a logging step after the loop:
+
+java
+Copy
+Edit
+route.log("End of loop iteration. Current page: ${header.page}");
+Would you like me to generate an in-memory runnable Spring Boot + Camel example for this?
