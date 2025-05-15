@@ -1,0 +1,89 @@
+@Component
+public class CsvMappingProcessor implements Processor {
+
+    @Autowired
+    private TransformService transformService;
+
+    @Override
+    public void process(Exchange exchange) throws Exception {
+        JSONObject config = new JSONObject(exchange.getProperty("stepConfig", String.class));
+        JSONArray mappings = config.getJSONArray("fieldMappings");
+
+        Map<String, Object> sourceRow = exchange.getIn().getBody(Map.class); // Row from SQL
+        Map<String, String> csvRow = new LinkedHashMap<>();
+
+        for (int i = 0; i < mappings.length(); i++) {
+            JSONObject mapping = mappings.getJSONObject(i);
+            String source = mapping.getString("sourceField");
+            String target = mapping.getString("targetField");
+
+            String rawValue = String.valueOf(sourceRow.get(source));
+            List<String> transforms = mapping.has("transforms")
+                ? mapping.getJSONArray("transforms").toList().stream()
+                    .map(Object::toString).collect(Collectors.toList())
+                : Collections.emptyList();
+
+            String finalValue = transformService.applyChain(transforms, rawValue);
+            csvRow.put(target, finalValue);
+        }
+
+        exchange.getIn().setBody(csvRow);
+    }
+}
+
+
+
+{
+  "fieldMappings": [
+    {
+      "sourceField": "emp_id",
+      "targetField": "Employee__c.Id__c",
+      "transforms": ["prefix:EMP_", "uppercase"]
+    },
+    {
+      "sourceField": "name",
+      "targetField": "Employee__c.Name__c"
+    },
+    {
+      "sourceField": "salary",
+      "targetField": "Employee__c.Salary__c",
+      "transforms": ["multiply:1.2", "format:%.2f"]
+    }
+  ]
+}
+
+
+@Component
+public class TransformService {
+
+    public String applyChain(List<String> transforms, String input) {
+        String value = input;
+
+        for (String transform : transforms) {
+            if (transform.startsWith("prefix:")) {
+                value = transform.substring(7) + value;
+            } else if (transform.startsWith("suffix:")) {
+                value = value + transform.substring(7);
+            } else if (transform.equals("uppercase")) {
+                value = value.toUpperCase();
+            } else if (transform.equals("lowercase")) {
+                value = value.toLowerCase();
+            } else if (transform.startsWith("multiply:")) {
+                double factor = Double.parseDouble(transform.substring(9));
+                value = String.valueOf(Double.parseDouble(value) * factor);
+            } else if (transform.startsWith("format:")) {
+                String format = transform.substring(7);
+                value = String.format(format, Double.parseDouble(value));
+            }
+            // Add more cases as needed
+        }
+
+        return value;
+    }
+}
+
+1. Step: Extract data from source SQL
+2. Step: Enhance with lookup columns (join/lookup SQL queries)
+3. Step: Transform columns (e.g., rename, format, convert)
+4. Step: Send to Salesforce via Bulk V2
+5. Step: Record audit log (insert sent rows into audit table)
